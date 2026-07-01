@@ -1,0 +1,2 @@
+# Local config — may contain secrets (HF_TOKEN). Use .env.example as the template.
+.env
