@@ -2,14 +2,24 @@
 
 A self-contained [llama.cpp](https://github.com/ggml-org/llama.cpp) inference server, run as a Docker Compose service.
 
-Point it at any GGUF model on Hugging Face via a `.env` file — it **downloads the model on first run**, **caches it** in a persistent volume (so it's never re-downloaded), and serves an **OpenAI-compatible API** on GPU.
+Point it at any GGUF model on Hugging Face via a `.env` file — it **downloads the model on first run**, **caches it** in a persistent volume (so it's never re-downloaded), and serves an **OpenAI-compatible API**.
+
+Ships in three flavors so it runs on essentially any machine:
+
+| Backend    | Compose file                | Runs on                                              |
+|------------|-----------------------------|-----------------------------------------------------|
+| **CUDA**   | `docker-compose.yml`        | NVIDIA GPUs                                          |
+| **Vulkan** | `docker-compose.vulkan.yml` | AMD or Intel GPUs (integrated or discrete)          |
+| **CPU**    | `docker-compose.cpu.yml`    | Any machine, no GPU needed                           |
 
 ---
 
 ## Requirements
 
-- Docker + Docker Compose v2
-- NVIDIA GPU with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed (so `docker run --gpus all` works)
+- Docker + Docker Compose v2 (all backends)
+- **CUDA backend:** NVIDIA GPU with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed (so `docker run --gpus all` works)
+- **Vulkan backend:** AMD/Intel GPU with working Mesa drivers on the host. See [Backends](#backends-cuda--vulkan--cpu) below.
+- **CPU backend:** nothing beyond Docker.
 
 ## Quick start
 
@@ -17,17 +27,21 @@ Point it at any GGUF model on Hugging Face via a `.env` file — it **downloads 
 # 1. Create your .env from the template, then edit it
 cp .env.example .env
 
-# 2. Start the service
-docker compose up -d
+# 2. Start the service — pick the backend for your hardware:
+docker compose up -d                              # NVIDIA (CUDA)
+# docker compose -f docker-compose.vulkan.yml up -d   # AMD / Intel GPU (Vulkan)
+# docker compose -f docker-compose.cpu.yml up -d      # no GPU (CPU)
 
 # 3. Watch it download + load the model on first run
-docker compose logs -f
+docker compose logs -f          # add -f <file> to match the backend you started
 
 # 4. Once healthy, it serves on http://localhost:8080
 curl http://localhost:8080/health          # -> {"status":"ok"}
 ```
 
-Stop it with `docker compose down` — the downloaded models stay in the cache volume.
+Stop it with `docker compose down` (add `-f <file>` for the vulkan/cpu backends) — the downloaded models stay in the cache volume, which is **shared across all three backends** so a model is only ever downloaded once.
+
+> Every `docker compose` command below applies to any backend — just add `-f docker-compose.vulkan.yml` or `-f docker-compose.cpu.yml` to target the non-default one. Run **one backend at a time** (they'd all fight for port `8080`).
 
 ## Configuration (`.env`)
 
@@ -61,13 +75,47 @@ docker volume inspect llamacpp-infer_llama-models   # see where the cache lives
 docker volume rm llamacpp-infer_llama-models        # wipe all downloaded models
 ```
 
-### GPU
-The `deploy.resources.reservations.devices` block is the Compose equivalent of `docker run --gpus all`. Confirm the model is actually on the GPU:
+### GPU (CUDA)
+In `docker-compose.yml`, the `deploy.resources.reservations.devices` block is the Compose equivalent of `docker run --gpus all`. Confirm the model is actually on the GPU:
 
 ```bash
 nvidia-smi                                          # llama-server should hold VRAM
 docker logs llama-server 2>&1 | grep -i offload     # "offloaded N/N layers to GPU"
 ```
+
+## Backends: CUDA / Vulkan / CPU
+
+Same server, same `.env`, same API — only the compute backend differs. Each uses a different llama.cpp image and a different way of reaching the hardware.
+
+### CUDA — `docker-compose.yml` (default)
+NVIDIA only, fastest on NVIDIA. Uses image `:server-cuda` and the NVIDIA Container Toolkit. This is the default file, so `docker compose up -d` just works.
+
+### Vulkan — `docker-compose.vulkan.yml` (AMD / Intel)
+GPU acceleration on **AMD or Intel** GPUs (integrated or discrete). Uses image `:server-vulkan`, reaching the GPU through the host's render node (`/dev/dri`) plus the `video`/`render` groups. (On NVIDIA, use the CUDA backend instead — it's faster.)
+
+```bash
+docker compose -f docker-compose.vulkan.yml up -d
+```
+
+Then confirm the GPU was found:
+
+```bash
+docker logs llama-server-vulkan 2>&1 | grep -i vulkan   # "Vulkan0: <your GPU>"
+```
+
+Notes:
+
+- **AMD:** additionally uncomment the `- /dev/kfd:/dev/kfd` device line in the compose file.
+- **GPU not detected?** Run `getent group render video` on the **host** and replace the group names in `group_add:` with those numeric GIDs. Some host/driver combos also need extra GL libraries in the image — see [this discussion](https://github.com/ggml-org/llama.cpp/discussions/16138).
+
+### CPU — `docker-compose.cpu.yml` (no GPU)
+Runs anywhere Docker runs, no GPU or drivers required. Uses image `:server`. There's no GPU block at all; instead, tune `THREADS` in `.env` (`0` = auto-detect cores). `NGL` is ignored.
+
+```bash
+docker compose -f docker-compose.cpu.yml up -d
+```
+
+CPU inference is much slower than GPU — prefer smaller models and lower quants (e.g. `Q4_K_M` and below), and expect it to scale with core count and RAM bandwidth.
 
 ### `EXTRA_ARGS` (e.g. disabling multimodal)
 Some `llama-server` flags are presence-only (no value), so they can't be a simple env boolean. `EXTRA_ARGS` is appended verbatim to the server command:
